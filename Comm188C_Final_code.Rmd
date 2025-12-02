@@ -1,0 +1,652 @@
+---
+title: "FINAL_COMM_PROJECT"
+output: html_document
+date: "2025-05-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(dplyr)
+library(text2vec)
+library(clue)  
+library(caret) 
+library(ranger)
+library(stringr)
+library(stopwords)
+```
+
+
+```{r}
+new_tweets <- read.csv("gender-classifier-DFE-791531.csv")
+```
+
+
+
+```{r}
+normal <- read.csv("normal_tweets.csv")
+anxious <- read.csv("anxious_tweets.csv")
+lonely <- read.csv("lonely_tweets.csv")
+stressed <- read.csv("stressed_tweets.csv")
+
+normal <- normal %>% rename(tweet = cleaned_text)
+anxious <- anxious %>%  rename(tweet = X0)
+lonely <- lonely %>%  rename(tweet = X0)
+stressesd <- stressed %>%  rename(tweet = cleaned_text)
+```
+
+
+# Doc Embedding Random Sampling to determine average accuracy
+
+
+
+```{r}
+
+
+
+
+# Sample 50 from each and add a title
+sampled_normal <- normal %>% sample_n(50) %>% mutate(title = "normal")
+sampled_anxious <- anxious %>% sample_n(50) %>% mutate(title = "anxious")
+sampled_lonely <- lonely %>% sample_n(50) %>% mutate(title = "lonely")
+sampled_stressed <- stressed %>% sample_n(50) %>% mutate(title = "stressed")
+
+# Combine them into one dataframe
+df_all <- bind_rows(sampled_normal, sampled_anxious, sampled_lonely, sampled_stressed)
+
+```
+
+```{r}
+
+
+evaluate_glove_clustering <- function(df) {
+  docs <- df$tweet
+  true_labels <- df$title
+  
+  # Tokenize and build TCM
+  tokens <- itoken(docs, preprocessor = tolower, tokenizer = word_tokenizer, progressbar = FALSE)
+  vocab <- create_vocabulary(tokens)
+  vectorizer <- vocab_vectorizer(vocab)
+  tcm <- create_tcm(tokens, vectorizer, skip_grams_window = 5)
+  
+  # Train GloVe
+  glove <- GlobalVectors$new(rank = 50, x_max = 10)
+  word_vectors <- glove$fit_transform(tcm, n_iter = 10)
+  
+  # Get doc embeddings
+  get_doc_embedding <- function(doc, word_vectors) {
+    words <- word_tokenizer(tolower(doc))[[1]]
+    valid_words <- words[words %in% rownames(word_vectors)]
+    if (length(valid_words) == 0) return(rep(0, ncol(word_vectors)))
+    colMeans(word_vectors[valid_words, , drop = FALSE])
+  }
+  
+  doc_embeddings <- t(sapply(docs, get_doc_embedding, word_vectors = word_vectors))
+  
+  # Clustering
+  kmeans_glove <- kmeans(doc_embeddings, centers = 4, nstart = 25)
+  clusters <- kmeans_glove$cluster
+  
+  # Map clusters to labels
+  map_clusters_to_labels <- function(clusters, true_labels) {
+    cluster_table <- table(clusters, true_labels)
+    assignment <- solve_LSAP(cluster_table, maximum = TRUE)
+    mapping <- setNames(colnames(cluster_table)[assignment], rownames(cluster_table))
+    return(unname(mapping[as.character(clusters)]))
+  }
+  
+  mapped_preds <- map_clusters_to_labels(clusters, true_labels)
+  
+  # Evaluation
+  true_labels <- factor(true_labels)
+  mapped_preds <- factor(mapped_preds, levels = levels(true_labels))
+  
+  cm <- confusionMatrix(mapped_preds, true_labels)
+  precision <- cm$byClass[, "Precision"]
+  recall <- cm$byClass[, "Recall"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  accuracy <- cm$overall["Accuracy"]
+  
+  list(precision = precision, f1 = f1, accuracy = accuracy)
+}
+
+```
+
+
+
+
+
+```{r}
+results <- replicate(50, {
+  # Sample new batch
+  df_run <- bind_rows(
+    normal %>% sample_n(50) %>% mutate(title = "normal"),
+    anxious %>% sample_n(50) %>% mutate(title = "anxious"),
+    lonely %>% sample_n(50) %>% mutate(title = "lonely"),
+    stressed %>% sample_n(50) %>% mutate(title = "stressed")
+  )
+  
+  # Run GloVe + clustering + evaluation
+  evaluate_glove_clustering(df_run)
+}, simplify = FALSE)
+
+# Extract precision, f1, accuracy across runs
+avg_precision <- Reduce("+", lapply(results, function(x) x$precision)) / length(results)
+avg_f1 <- Reduce("+", lapply(results, function(x) x$f1)) / length(results)
+avg_accuracy <- mean(sapply(results, function(x) x$accuracy))
+
+# Show results
+data.frame(
+  Label = names(avg_precision),
+  Avg_Precision = avg_precision,
+  Avg_F1 = avg_f1
+) %>%
+  print()
+
+cat("Average Accuracy:", avg_accuracy, "\n")
+
+```
+
+
+
+# TF idf Random Sampling to determine average accuracy
+
+
+
+```{r}
+
+
+evaluate_tfidf_clustering <- function(df) {
+  docs <- df$tweet
+  true_labels <- df$title
+  
+  # Prepare tokens
+  tokens <- word_tokenizer(tolower(docs))
+  it <- itoken(tokens, progressbar = FALSE)
+  
+  # Build vocab, vectorizer, and DTM
+  vocab <- create_vocabulary(it)
+  vectorizer <- vocab_vectorizer(vocab)
+  dtm <- create_dtm(it, vectorizer)
+  
+  # TF-IDF transformation
+  tfidf <- TfIdf$new()
+  tfidf_matrix <- tfidf$fit_transform(dtm)
+  
+  # k-means clustering
+  kmeans_tf <- kmeans(tfidf_matrix, centers = 4, nstart = 25)
+  clusters <- kmeans_tf$cluster
+  
+  # Map clusters to emotion labels
+  map_clusters_to_labels <- function(clusters, true_labels) {
+    tab <- table(clusters, true_labels)
+    assignment <- solve_LSAP(tab, maximum = TRUE)
+    mapping <- setNames(colnames(tab)[assignment], rownames(tab))
+    mapped <- mapping[as.character(clusters)]
+    return(unname(mapped))
+  }
+  
+  mapped_preds <- map_clusters_to_labels(clusters, true_labels)
+  
+  # Evaluate
+  true_labels <- factor(true_labels)
+  mapped_preds <- factor(mapped_preds, levels = levels(true_labels))
+  
+  cm <- confusionMatrix(mapped_preds, true_labels)
+  precision <- cm$byClass[, "Precision"]
+  recall <- cm$byClass[, "Recall"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  accuracy <- cm$overall["Accuracy"]
+  
+  list(precision = precision, f1 = f1, accuracy = accuracy)
+}
+
+```
+
+
+```{r}
+# Repeat sampling + evaluation 50 times
+results_tfidf <- replicate(50, {
+  # Sample 50 tweets per class
+  df_sample <- bind_rows(
+    normal %>% sample_n(100) %>% mutate(title = "normal"),
+    anxious %>% sample_n(100) %>% mutate(title = "anxious"),
+    lonely %>% sample_n(100) %>% mutate(title = "lonely"),
+    stressed %>% sample_n(100) %>% mutate(title = "stressed")
+  )
+  
+  evaluate_tfidf_clustering(df_sample)
+}, simplify = FALSE)
+
+# Aggregate metrics
+avg_precision <- Reduce("+", lapply(results_tfidf, function(x) x$precision)) / length(results_tfidf)
+avg_f1 <- Reduce("+", lapply(results_tfidf, function(x) x$f1)) / length(results_tfidf)
+avg_accuracy <- mean(sapply(results_tfidf, function(x) x$accuracy))
+
+# Print results
+data.frame(
+  Emotion = names(avg_precision),
+  Avg_Precision = round(avg_precision, 3),
+  Avg_F1 = round(avg_f1, 3)
+) %>% print()
+
+cat("Average Accuracy:", round(avg_accuracy, 3), "\n")
+
+```
+
+
+
+# Random Forest random sampling to determine avereage accuracy 
+
+
+
+```{r}
+
+
+
+evaluate_glove_rf <- function(df) {
+  # Text preprocessing
+  docs <- df$tweet
+  labels <- as.factor(df$title)
+  
+  # Tokenization
+  tokens <- itoken(docs, preprocessor = tolower, tokenizer = word_tokenizer, progressbar = FALSE)
+  vocab <- create_vocabulary(tokens)
+  vectorizer <- vocab_vectorizer(vocab)
+  tcm <- create_tcm(tokens, vectorizer, skip_grams_window = 5)
+  
+  # Train GloVe word vectors
+  glove <- GlobalVectors$new(rank = 50, x_max = 10)
+  word_vectors <- glove$fit_transform(tcm, n_iter = 10)
+  
+  # Function to embed each document by averaging word vectors
+  get_doc_embedding <- function(doc, word_vectors) {
+    words <- word_tokenizer(tolower(doc))[[1]]
+    valid_words <- words[words %in% rownames(word_vectors)]
+    if (length(valid_words) == 0) return(rep(0, ncol(word_vectors)))
+    colMeans(word_vectors[valid_words, , drop = FALSE])
+  }
+  
+  # Compute doc embeddings
+  doc_embeddings <- t(sapply(docs, get_doc_embedding, word_vectors = word_vectors))
+  embedding_df <- as.data.frame(doc_embeddings)
+  embedding_df$topic <- labels
+  
+  # Train/test split
+  set.seed(123)
+  train_idx <- createDataPartition(embedding_df$topic, p = 0.8, list = FALSE)
+  train_data <- embedding_df[train_idx, ]
+  test_data <- embedding_df[-train_idx, ]
+  
+  # Random forest training with 5-fold CV
+  ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+  grid <- expand.grid(
+    .mtry = c(2, 5, 10),
+    .splitrule = "gini",
+    .min.node.size = c(1, 5, 10)
+  )
+  
+  rf_model <- train(
+    topic ~ .,
+    data = train_data,
+    method = "ranger",
+    trControl = ctrl,
+    tuneGrid = grid,
+    metric = "F1"
+  )
+  
+  # Predict and evaluate
+  test_pred <- predict(rf_model, newdata = test_data)
+  conf_mat <- confusionMatrix(test_pred, test_data$topic)
+  
+  precision <- diag(conf_mat$table) / colSums(conf_mat$table)
+  recall <- diag(conf_mat$table) / rowSums(conf_mat$table)
+  f1 <- 2 * precision * recall / (precision + recall)
+  accuracy <- conf_mat$overall["Accuracy"]
+  
+  list(precision = precision, recall = recall, f1 = f1, accuracy = accuracy)
+}
+
+```
+
+```{r}
+# Run the supervised GloVe classification model 50 times
+results_rf <- replicate(5, {
+  df_sample <- bind_rows(
+    normal %>% sample_n(200) %>% mutate(title = "normal"),
+    anxious %>% sample_n(200) %>% mutate(title = "anxious"),
+    lonely %>% sample_n(200) %>% mutate(title = "lonely"),
+    stressed %>% sample_n(200) %>% mutate(title = "stressed")
+  )
+  evaluate_glove_rf(df_sample)
+}, simplify = FALSE)
+
+# Aggregate metrics
+avg_precision <- Reduce("+", lapply(results_rf, function(x) x$precision)) / length(results_rf)
+avg_recall <- Reduce("+", lapply(results_rf, function(x) x$recall)) / length(results_rf)
+avg_f1 <- Reduce("+", lapply(results_rf, function(x) x$f1)) / length(results_rf)
+avg_accuracy <- mean(sapply(results_rf, function(x) x$accuracy))
+
+# Print results
+data.frame(
+  Emotion = names(avg_precision),
+  Avg_Precision = round(avg_precision, 3),
+  Avg_Recall = round(avg_recall, 3),
+  Avg_F1 = round(avg_f1, 3)
+) %>% print()
+
+cat("Average Accuracy:", round(avg_accuracy, 3), "\n")
+
+```
+
+
+
+
+# ---------THE MODEL APPLIED TO THE NEW TWEET--------
+
+
+```{r}
+# --- Load libraries ---
+
+
+# --- Step 1: Sample 200 tweets from each emotion class ---
+df <- bind_rows(
+  normal %>% sample_n(200) %>% mutate(title = "normal"),
+  anxious %>% sample_n(200) %>% mutate(title = "anxious"),
+  lonely %>% sample_n(200) %>% mutate(title = "lonely"),
+  stressed %>% sample_n(200) %>% mutate(title = "stressed")
+)
+
+# --- Step 2: Train GloVe word vectors ---
+tokens <- itoken(df$tweet, preprocessor = tolower, tokenizer = word_tokenizer, progressbar = FALSE)
+vocab <- create_vocabulary(tokens)
+vectorizer <- vocab_vectorizer(vocab)
+tcm <- create_tcm(tokens, vectorizer, skip_grams_window = 5)
+
+glove <- GlobalVectors$new(rank = 50, x_max = 10)
+word_vectors <- glove$fit_transform(tcm, n_iter = 10)
+
+# Save word vectors
+saveRDS(word_vectors, "glove_word_vectors.rds")
+
+# --- Step 3: Compute document embeddings ---
+get_doc_embedding <- function(doc, word_vectors) {
+  words <- word_tokenizer(tolower(doc))[[1]]
+  valid_words <- words[words %in% rownames(word_vectors)]
+  if (length(valid_words) == 0) return(rep(0, ncol(word_vectors)))
+  colMeans(word_vectors[valid_words, , drop = FALSE])
+}
+
+doc_embeddings <- t(sapply(df$tweet, get_doc_embedding, word_vectors = word_vectors))
+embedding_df <- as.data.frame(doc_embeddings)
+embedding_df$topic <- as.factor(df$title)
+
+# --- Step 4: Train/test split ---
+set.seed(123)
+train_idx <- createDataPartition(embedding_df$topic, p = 0.8, list = FALSE)
+train_data <- embedding_df[train_idx, ]
+test_data <- embedding_df[-train_idx, ]
+
+# --- Step 5: Train Random Forest with cross-validation ---
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+grid <- expand.grid(
+  .mtry = c(2, 5, 10),
+  .splitrule = "gini",
+  .min.node.size = c(1, 5, 10)
+)
+
+rf_model <- train(
+  topic ~ .,
+  data = train_data,
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = grid,
+  metric = "F1"
+)
+
+# Save trained model
+saveRDS(rf_model, "rf_model.rds")
+
+```
+
+
+
+
+```{r}
+# --- Load saved model and word vectors ---
+rf_model <- readRDS("rf_model.rds")
+word_vectors <- readRDS("glove_word_vectors.rds")
+
+# --- Define embedding function again ---
+get_doc_embedding <- function(doc, word_vectors) {
+  words <- word_tokenizer(tolower(doc))[[1]]
+  valid_words <- words[words %in% rownames(word_vectors)]
+  if (length(valid_words) == 0) return(rep(0, ncol(word_vectors)))
+  colMeans(word_vectors[valid_words, , drop = FALSE])
+}
+
+# --- Define chunked processor with improved cleaning ---
+process_chunk_with_cleaned <- function(text_chunk, word_vectors, rf_model) {
+  # Step 1: Remove multibyte (non-ASCII) chars
+  text_clean_ascii <- iconv(text_chunk, from = "UTF-8", to = "ASCII", sub = "")
+  
+  # Step 2: Lowercase, remove punctuation and numbers
+  text_clean <- tolower(text_clean_ascii)
+  text_clean <- str_replace_all(text_clean, "[[:punct:]]", " ")
+  text_clean <- str_replace_all(text_clean, "[0-9]", " ")
+  text_clean <- str_squish(text_clean)
+
+  # Step 3: Tokenize, remove stopwords, short tokens, and reassemble
+  tokenized_clean <- lapply(text_clean, function(doc) {
+    tokens <- word_tokenizer(doc)[[1]]
+    tokens <- tokens[!(tokens %in% stopwords("en"))]
+    tokens <- tokens[nchar(tokens) > 2]
+    paste(tokens, collapse = " ")
+  })
+
+  # Step 4: Compute GloVe embeddings (based on cleaned text)
+  embeddings <- t(sapply(text_clean, get_doc_embedding, word_vectors = word_vectors))
+  embed_df <- as.data.frame(embeddings)
+  
+  # Step 5: Predict emotions
+  preds <- predict(rf_model, newdata = embed_df)
+  
+  return(list(
+    predictions = as.character(preds),
+    cleaned_text = unlist(tokenized_clean)
+  ))
+}
+
+```
+
+
+
+
+```{r}
+# --- Chunk settings ---
+chunk_size <- 1000
+n <- nrow(new_tweets)
+num_chunks <- ceiling(n / chunk_size)
+
+# --- Initialize result containers ---
+all_preds <- vector("character", length = n)
+all_cleaned <- vector("character", length = n)
+
+# --- Loop through chunks ---
+for (i in seq_len(num_chunks)) {
+  start <- (i - 1) * chunk_size + 1
+  end <- min(i * chunk_size, n)
+  
+  message(sprintf("Processing rows %d to %d...", start, end))
+  
+  chunk_text <- new_tweets$description[start:end]
+  result <- process_chunk_with_cleaned(chunk_text, word_vectors, rf_model)
+  
+  all_preds[start:end] <- result$predictions
+  all_cleaned[start:end] <- result$cleaned_text
+}
+
+# --- Add results back to new_tweets ---
+new_tweets$predicted_emotion <- all_preds
+new_tweets$cleaned_tweet <- all_cleaned
+
+```
+
+
+```{r}
+reticulate::py_install("sentence-transformers", pip = TRUE)
+```
+
+
+
+#       --- K means on doc embedding ---
+
+
+
+```{r}
+econ_keywords <- c("rent", "money", "job", "bills", "inflation", "gas", "bank", "price", "cost", "paycheck", "food")
+
+econ_tweets <- new_tweets %>%
+  filter(str_detect(tolower(cleaned_tweet), paste(econ_keywords, collapse = "|")))
+econ_anxious <- econ_tweets %>%
+  filter(predicted_emotion == "anxious")
+
+econ_anxious %>%
+  group_by(gender) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(prop = count / sum(count))
+filtered <- econ_anxious %>%
+  filter(gender %in% c("male", "female"))
+ggplot(filtered, aes(x = gender, fill = gender)) +
+  geom_bar() +
+  labs(title = "Anxious Tweets About the Economy by Gender",
+       x = "Gender", y = "Tweet Count") +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+library(reticulate)
+
+# Load Python libraries
+transformers <- import("sentence_transformers")
+np <- import("numpy")
+
+# Load model
+model <- transformers$SentenceTransformer('all-MiniLM-L6-v2')
+
+# Get cleaned tweets
+texts <- new_tweets$cleaned_tweet
+
+# Generate embeddings
+embeddings <- model$encode(texts)
+
+# Convert to matrix for R
+bert_matrix <- matrix(unlist(embeddings), ncol = 384, byrow = TRUE)
+
+```
+
+
+```{r}
+set.seed(123)
+kmeans_result <- kmeans(bert_matrix, centers = 10)
+new_tweets$bert_cluster <- kmeans_result$cluster  
+library(tidytext)
+top_words <- new_tweets %>%
+  mutate(cluster = bert_cluster) %>%
+  unnest_tokens(word, cleaned_tweet) %>%
+  anti_join(stop_words) %>%
+  count(cluster, word, sort = TRUE) %>%
+  group_by(cluster) %>%
+  slice_max(n, n = 10)
+
+ggplot(top_words, aes(x = reorder_within(word, n, cluster), y = n, fill = factor(cluster))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ cluster, scales = "free") +
+  scale_x_reordered() +
+  coord_flip()
+
+```
+
+
+```{r}
+library(tidytext)
+library(ggplot2)
+custom_stopwords <- c("http", "https", "www", "rt", "t.co", "fan", "music", "love", "life", "follow", "news", "don", "amp")
+library(stringr)
+
+new_tweets <- new_tweets %>%
+  mutate(cleaned_tweet = str_remove_all(cleaned_tweet, "http\\S+|www\\S+"))
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+
+top_words <- new_tweets %>%
+  unnest_tokens(word, cleaned_tweet) %>%
+  filter(!word %in% custom_stopwords) %>%
+  anti_join(stop_words) %>%
+  count(bert_cluster, word, sort = TRUE) %>%
+  group_by(bert_cluster) %>%
+  slice_max(n, n = 10)
+ggplot(top_words, aes(x = reorder_within(word, n, bert_cluster), y = n, fill = factor(bert_cluster))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ bert_cluster, scales = "free") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(title = "Top Words in Each BERT Topic Cluster", x = "Word", y = "Frequency")
+
+
+```
+
+
+```{r}
+new_tweets %>%
+  count(bert_cluster, predicted_emotion) %>%
+  group_by(bert_cluster) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = factor(bert_cluster), y = prop, fill = predicted_emotion)) +
+  geom_col(position = "dodge") +
+  labs(title = "Emotion Breakdown by BERT Cluster", x = "BERT Cluster", y = "Proportion")
+
+```
+
+```{r}
+install.packages("umap")
+```
+
+
+
+```{r}
+library(umap)
+
+umap_result <- umap(bert_matrix)
+
+plot_df <- data.frame(UMAP1 = umap_result$layout[,1],
+                      UMAP2 = umap_result$layout[,2],
+                      cluster = factor(new_tweets$bert_cluster),
+                      emotion = new_tweets$predicted_emotion)
+
+ggplot(plot_df, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "UMAP Projection of BERT Clusters")
+
+```
+
+
+```{r}
+ggplot(plot_df, aes(x = UMAP1, y = UMAP2, color = emotion)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "UMAP Projection Colored by Emotion")
+
+```
+
+
+
+
+
